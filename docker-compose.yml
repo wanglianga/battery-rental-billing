@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: battery-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: battery
+      POSTGRES_PASSWORD: battery123
+      POSTGRES_DB: battery_rental
+      TZ: Asia/Shanghai
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U battery -d battery_rental"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: battery-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb"]
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: battery-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SERVER_PORT: 8080
+      SERVER_MODE: release
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: battery
+      POSTGRES_PASSWORD: battery123
+      POSTGRES_DB: battery_rental
+      POSTGRES_SSLMODE: disable
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+      REDIS_DB: 0
+      JWT_SECRET: battery-rental-super-secret-key-2024-production
+      JWT_EXPIRE_HOURS: 72
+      DEPOSIT_AMOUNT: 29900
+      TZ: Asia/Shanghai
+    ports:
+      - "8080:8080"
+    volumes:
+      - server_logs:/app/logs
+
+volumes:
+  postgres_data:
+  redis_data:
+  server_logs:
