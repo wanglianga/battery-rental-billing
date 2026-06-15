@@ -6,6 +6,8 @@
 
 > 请开发共享电池租借计费服务，使用 Gin、PostgreSQL 和 Redis 维护电池柜、格口、电池编号、租借订单、押金、计费规则、归还记录、异常扣费和维修状态。用户扫码开柜租借电池，柜机上报门锁、电量、温度、锁舌、格口占用和离线补报；运营人员处理丢失、损坏、跨柜归还、账单争议和客服申诉。服务要能解释押金冻结、开柜成功、计费开始、归还识别、封顶扣费和退款释放每一步，面对重复扫码、设备断网、补报乱序和支付回调重放时不能多扣或漏扣。
 
+> 修复 PostgreSQL 自动迁移中 slots 与 batteries 相互外键导致的启动失败，确保全新数据库下服务能完成迁移、种子数据初始化并通过 /api/v1/health；随后补测注册登录、充值回调幂等、扫码租借押金冻结、归还结算封顶与退款释放、设备离线补报乱序等核心链路。
+
 ## 技术栈
 
 | 模块 | 技术 |
@@ -146,6 +148,8 @@ docker compose down
 # 清理数据卷（谨慎！会删除所有数据库和Redis数据）
 docker compose down -v
 ```
+
+> **注意**：当前验证环境因网络限制无法连接 Docker Hub 拉取镜像，导致 `docker compose up --build` 构建失败。Docker 配置文件（Dockerfile、docker-compose.yml、.dockerignore）齐全，网络正常时可直接执行上述命令。错误信息：`failed to fetch anonymous token: dial tcp 124.11.210.175:443: connectex: A connection attempt failed`。
 
 ### 方式二：本机开发模式启动
 

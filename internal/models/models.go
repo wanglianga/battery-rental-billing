@@ -327,7 +327,7 @@ const (
 type PaymentRecord struct {
 	BaseModel
 	PayNo       string    `gorm:"size:64;uniqueIndex;not null" json:"pay_no"`
-	OrderID     uint64    `gorm:"not null;index" json:"order_id"`
+	OrderID     *uint64   `gorm:"index" json:"order_id"`
 	UserID      uint64    `gorm:"not null;index" json:"user_id"`
 	PayType     string    `gorm:"size:16;not null" json:"pay_type"`
 	Amount      int64     `gorm:"not null" json:"amount"`

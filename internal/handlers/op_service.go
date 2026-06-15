@@ -50,7 +50,7 @@ func (s *PaymentService) Recharge(ctx context.Context, userID uint64, req *Recha
 
 	pay := models.PaymentRecord{
 		PayNo:    payNo,
-		OrderID:  0,
+		OrderID:  nil,
 		UserID:   userID,
 		PayType:  req.PayType,
 		Amount:   req.Amount,
@@ -188,9 +188,9 @@ func (s *PaymentService) HandleCallback(ctx context.Context, req *PayCallbackReq
 			return nil, fmt.Errorf("更新支付单失败")
 		}
 
-		if pay.OrderID > 0 {
+		if pay.OrderID != nil && *pay.OrderID > 0 {
 			var order models.RentalOrder
-			if err := tx.Clauses(clauseUpdateLock).First(&order, pay.OrderID).Error; err == nil {
+			if err := tx.Clauses(clauseUpdateLock).First(&order, *pay.OrderID).Error; err == nil {
 				order.PaidFee += pay.Amount
 				order.PayTxnID = &req.ThirdTxnNo
 				tx.Save(&order)

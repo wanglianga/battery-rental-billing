@@ -13,6 +13,7 @@ import (
 	"battery-rental/internal/utils"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type RentalService struct{}
@@ -264,6 +265,6 @@ func LockUpdate() interface{} {
 	return locker{}
 }
 
-var clauseUpdateLock = gorm.Expr("FOR UPDATE")
+var clauseUpdateLock = clause.Locking{Strength: "UPDATE"}
 
 var _ = LockUpdate

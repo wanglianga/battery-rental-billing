@@ -205,6 +205,13 @@ func (s *ReportService) OfflineReplay(ctx context.Context, req *OfflineBatchReq)
 	processed := 0
 	skipped := 0
 
+	lastSeqKey := fmt.Sprintf("last_seq:%s", req.CabinetNo)
+	lastSeqStr, _ := redisx.Get(ctx, lastSeqKey)
+	lastSeqInt := int64(0)
+	if lastSeqStr != "" {
+		fmt.Sscanf(lastSeqStr, "%d", &lastSeqInt)
+	}
+
 	for _, r := range req.Reports {
 		dedupKey := fmt.Sprintf("offline_rpt:%s:%d", req.CabinetNo, r.ReportSeq)
 		ok, err := redisx.SetNXWithTTL(ctx, dedupKey, "1", 30*24*time.Hour)
@@ -222,18 +229,30 @@ func (s *ReportService) OfflineReplay(ctx context.Context, req *OfflineBatchReq)
 			deviceTime = time.Now()
 		}
 
+		isProcessed := false
+		if r.ReportSeq > lastSeqInt {
+			isProcessed = true
+			lastSeqInt = r.ReportSeq
+			_ = redisx.SetEX(ctx, lastSeqKey, fmt.Sprintf("%d", lastSeqInt), 30*24*time.Hour)
+		}
+
+		now := time.Now()
 		report := models.CabinetReport{
 			CabinetID:  0,
 			ReportNo:   utils.GenReportNo("OFF", req.CabinetNo),
 			ReportSeq:  r.ReportSeq,
 			ReportType: models.ReportType(r.ReportType),
 			DeviceTime: deviceTime,
-			ServerTime: time.Now(),
+			ServerTime: now,
 			IsReplay:   true,
-			Processed:  false,
+			Processed:  isProcessed,
 			Payload:    r.Payload,
 			SlotNo:     r.SlotNo,
 			BatteryNo:  &r.BatteryNo,
+		}
+
+		if isProcessed {
+			report.ProcessedAt = &now
 		}
 
 		var cabinet models.Cabinet
@@ -245,32 +264,56 @@ func (s *ReportService) OfflineReplay(ctx context.Context, req *OfflineBatchReq)
 			skipped++
 			continue
 		}
-		processed++
 
-		s.processOfflineReport(ctx, req.CabinetNo, r)
+		if isProcessed {
+			processed++
+			s.processOfflineReportDirect(ctx, req.CabinetNo, r)
+		} else {
+			skipped++
+		}
 	}
 
 	return processed, skipped, nil
 }
 
-func (s *ReportService) processOfflineReport(ctx context.Context, cabinetNo string, r OfflineReportItem) {
+func (s *ReportService) processOfflineReportDirect(ctx context.Context, cabinetNo string, r OfflineReportItem) {
 	switch r.ReportType {
 	case string(models.ReportBattery):
 		var breq BatteryReportReq
 		if err := json.Unmarshal([]byte(r.Payload), &breq); err == nil {
-			breq.CabinetNo = cabinetNo
-			_ = s.BatteryReport(ctx, &breq)
+			now := time.Now()
+			batteryNo := r.BatteryNo
+			if batteryNo == "" {
+				batteryNo = breq.BatteryNo
+			}
+			if batteryNo != "" {
+				database.DB.Model(&models.Battery{}).Where("battery_no = ?", batteryNo).Updates(map[string]interface{}{
+					"soc":            breq.SOC,
+					"temperature":    breq.Temperature,
+					"last_report_at": now,
+				})
+			}
 		}
 	case string(models.ReportLock):
 		var lreq LockReportReq
 		if err := json.Unmarshal([]byte(r.Payload), &lreq); err == nil {
-			lreq.CabinetNo = cabinetNo
-			_ = s.LockReport(ctx, &lreq)
+			if lreq.LockType == "unlock" && lreq.LockResult == 1 {
+				slotNo := lreq.SlotNo
+				if slotNo == 0 && r.SlotNo != nil {
+					slotNo = *r.SlotNo
+				}
+				if cabinetNo != "" && slotNo > 0 {
+					rental := NewRentalService()
+					_ = rental.ConfirmUnlock(ctx, cabinetNo, slotNo, true)
+				}
+			}
 		}
 	case string(models.ReportSlot):
 		var sreq SlotStatusReq
 		if err := json.Unmarshal([]byte(r.Payload), &sreq); err == nil {
-			sreq.CabinetNo = cabinetNo
+			if sreq.CabinetNo == "" {
+				sreq.CabinetNo = cabinetNo
+			}
 			_ = s.SlotReport(ctx, &sreq)
 		}
 	}
@@ -284,6 +327,8 @@ func (s *ReportService) saveReport(ctx context.Context, cabinetNo string, seq in
 		}
 		return fmt.Errorf("查询柜机失败")
 	}
+
+	isProcessed := true
 
 	if seq > 0 {
 		dedupKey := fmt.Sprintf("rpt:%s:%d", cabinetNo, seq)
@@ -301,10 +346,11 @@ func (s *ReportService) saveReport(ctx context.Context, cabinetNo string, seq in
 		if lastSeq != "" {
 			fmt.Sscanf(lastSeq, "%d", &lastSeqInt)
 		}
-		if seq < lastSeqInt {
-			return fmt.Errorf("乱序上报，已保存但不处理")
+		if seq <= lastSeqInt {
+			isProcessed = false
+		} else {
+			_ = redisx.SetEX(ctx, lastSeqKey, fmt.Sprintf("%d", seq), 30*24*time.Hour)
 		}
-		_ = redisx.SetEX(ctx, lastSeqKey, fmt.Sprintf("%d", seq), 30*24*time.Hour)
 	}
 
 	deviceTime, _ := time.Parse(time.RFC3339, deviceTimeStr)
@@ -323,17 +369,21 @@ func (s *ReportService) saveReport(ctx context.Context, cabinetNo string, seq in
 		DeviceTime: deviceTime,
 		ServerTime: now,
 		IsReplay:   false,
-		Processed:  true,
-		ProcessedAt: &now,
+		Processed:  isProcessed,
 		Payload:    string(payloadBytes),
 		SlotNo:     slotNo,
 		BatteryNo:  batteryNo,
 	}
+
+	if isProcessed {
+		report.ProcessedAt = &now
+	}
+
 	if err := database.DB.Create(&report).Error; err != nil {
 		return fmt.Errorf("保存上报记录失败")
 	}
 
-	if rtype == models.ReportHeartbeat {
+	if rtype == models.ReportHeartbeat && isProcessed {
 		database.DB.Model(&cabinet).Updates(map[string]interface{}{
 			"status":         models.CabinetOnline,
 			"heartbeat_at":   now,
@@ -341,5 +391,10 @@ func (s *ReportService) saveReport(ctx context.Context, cabinetNo string, seq in
 			"firmware_ver":   cabinet.FirmwareVer,
 		})
 	}
+
+	if !isProcessed {
+		return fmt.Errorf("乱序上报，已保存但不处理")
+	}
+
 	return nil
 }

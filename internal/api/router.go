@@ -14,7 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
-	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Router struct {
@@ -613,7 +613,7 @@ func (r *Router) AssignBattery(c *gin.Context) {
 		return
 	}
 	var slot models.Slot
-	if err := tx.Clauses(clauseUpdateLock).Where("cabinet_id = ? AND slot_no = ?", cab.ID, req.SlotNo).
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("cabinet_id = ? AND slot_no = ?", cab.ID, req.SlotNo).
 		First(&slot).Error; err != nil {
 		tx.Rollback()
 		utils.Fail(c, 404, "格口不存在")
@@ -625,7 +625,7 @@ func (r *Router) AssignBattery(c *gin.Context) {
 		return
 	}
 	var bat models.Battery
-	if err := tx.Clauses(clauseUpdateLock).Where("battery_no = ?", req.BatteryNo).First(&bat).Error; err != nil {
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("battery_no = ?", req.BatteryNo).First(&bat).Error; err != nil {
 		tx.Rollback()
 		utils.Fail(c, 404, "电池不存在")
 		return
@@ -639,8 +639,6 @@ func (r *Router) AssignBattery(c *gin.Context) {
 	tx.Commit()
 	utils.OK(c, nil)
 }
-
-var clauseUpdateLock = gorm.Expr("FOR UPDATE")
 
 func (r *Router) ListRules(c *gin.Context) {
 	var list []models.BillingRule
