@@ -124,13 +124,34 @@ type BillingRule struct {
 type OrderStatus string
 
 const (
-	OrderPending    OrderStatus = "pending"
-	OrderRenting    OrderStatus = "renting"
-	OrderReturning  OrderStatus = "returning"
-	OrderCompleted  OrderStatus = "completed"
-	OrderLost       OrderStatus = "lost"
-	OrderDisputed   OrderStatus = "disputed"
-	OrderCancelled  OrderStatus = "cancelled"
+	OrderPending             OrderStatus = "pending"
+	OrderRenting             OrderStatus = "renting"
+	OrderReturning           OrderStatus = "returning"
+	OrderCompleted           OrderStatus = "completed"
+	OrderLost                OrderStatus = "lost"
+	OrderDisputed            OrderStatus = "disputed"
+	OrderCancelled           OrderStatus = "cancelled"
+	OrderAbnormal            OrderStatus = "abnormal"
+	OrderAbnormalCompensated OrderStatus = "abnormal_compensated"
+)
+
+type AbnormalReason string
+
+const (
+	AbnormalReasonUnlockDoorNotOpen AbnormalReason = "door_not_open"
+	AbnormalReasonBatteryMissing AbnormalReason = "battery_missing"
+	AbnormalReasonLockStuck AbnormalReason = "lock_stuck"
+	AbnormalReasonCabinetOffline AbnormalReason = "cabinet_offline"
+)
+
+type CompensationAction string
+
+const (
+	CompensationNone CompensationAction = "pending"
+	CompensationRefundDeposit CompensationAction = "refund_deposit"
+	CompensationRecreateOrder CompensationAction = "recreate_order"
+	CompensationManualReview CompensationAction = "manual_review"
+	CompensationDone CompensationAction = "completed"
 )
 
 type RentalOrder struct {
@@ -157,6 +178,13 @@ type RentalOrder struct {
 	StartSOC      int         `gorm:"default:0" json:"start_soc"`
 	EndSOC        int         `gorm:"default:0" json:"end_soc"`
 	CrossCabinet  bool        `gorm:"default:false;not null" json:"cross_cabinet"`
+	AbnormalReason AbnormalReason `gorm:"size:32;index" json:"abnormal_reason,omitempty"`
+	CompensationAction CompensationAction `gorm:"size:32;index" json:"compensation_action,omitempty"`
+	CompensationStatus int `gorm:"default:0;not null" json:"compensation_status"`
+	CompensationRemark string `gorm:"size:512" json:"compensation_remark"`
+	CompensatedBy  *uint64 `gorm:"index" json:"compensated_by"`
+	CompensatedAt  *time.Time `json:"compensated_at"`
+	BillingEnabled  bool        `gorm:"default:true;not null" json:"billing_enabled"`
 	Remarks       string      `gorm:"size:512" json:"remarks"`
 	User          User        `gorm:"foreignKey:UserID" json:"-"`
 	Battery       Battery     `gorm:"foreignKey:BatteryID" json:"battery,omitempty"`
@@ -188,6 +216,15 @@ type DepositRecord struct {
 	User       User          `gorm:"foreignKey:UserID" json:"-"`
 }
 
+type CrossReturnCategory string
+
+const (
+	CrossReturnNormal        CrossReturnCategory = "normal_settlement"
+	CrossReturnSuspectSwapped CrossReturnCategory = "suspect_swapped"
+	CrossReturnRepairInbound CrossReturnCategory = "repair_inbound"
+	CrossReturnUnclaimed     CrossReturnCategory = "unclaimed"
+)
+
 type ReturnRecord struct {
 	BaseModel
 	OrderID     uint64     `gorm:"not null;uniqueIndex" json:"order_id"`
@@ -200,6 +237,23 @@ type ReturnRecord struct {
 	SOC         int        `gorm:"default:0" json:"soc"`
 	Temperature float64    `json:"temperature"`
 	CrossCabinet bool       `gorm:"default:false;not null" json:"cross_cabinet"`
+	CrossCategory CrossReturnCategory `gorm:"size:32;index" json:"cross_category,omitempty"`
+	JBatteryNoMatch   bool `gorm:"default:false;not null" json:"judge_battery_no_match"`
+	JBatteryNoEvidence string `gorm:"size:512" json:"judge_battery_no_evidence"`
+	JOriginalOrderValid bool `gorm:"default:false;not null" json:"judge_original_order_valid"`
+	JOriginalOrderEvidence string `gorm:"size:512" json:"judge_original_order_evidence"`
+	JSlotStateOK    bool `gorm:"default:false;not null" json:"judge_slot_state_ok"`
+	JSlotStateEvidence string `gorm:"size:512" json:"judge_slot_state_evidence"`
+	JSOCOK          bool `gorm:"default:false;not null" json:"judge_soc_ok"`
+	JSOCEvidence    string `gorm:"size:512" json:"judge_soc_evidence"`
+	JTemperatureOK  bool `gorm:"default:false;not null" json:"judge_temperature_ok"`
+	JTemperatureEvidence string `gorm:"size:512" json:"judge_temperature_evidence"`
+	JFromCabinetMatch    bool   `gorm:"default:false;not null" json:"judge_from_cabinet_match"`
+	JFromCabinetEvidence string `gorm:"size:512" json:"judge_from_cabinet_evidence"`
+	JUserIdentityMatch   bool   `gorm:"default:false;not null" json:"judge_user_identity_match"`
+	JUserIdentityEvidence string `gorm:"size:512" json:"judge_user_identity_evidence"`
+	JBatteryStatusHistory string `gorm:"size:512" json:"judge_battery_status_history"`
+	JudgeSummary     string `gorm:"type:text" json:"judge_summary"`
 	FeeCalc     int64      `gorm:"default:0" json:"fee_calc"`
 	FeeCapHit   bool       `gorm:"default:false;not null" json:"fee_cap_hit"`
 	Remarks     string     `gorm:"size:256" json:"remarks"`
@@ -209,12 +263,19 @@ type ReturnRecord struct {
 type ExceptionType string
 
 const (
-	ExcepLost        ExceptionType = "lost"
-	ExcepDamage      ExceptionType = "damage"
-	ExcepOverdue     ExceptionType = "overdue"
-	ExcepCrossReturn ExceptionType = "cross_return"
-	ExcepManual      ExceptionType = "manual"
-	ExcepDeviceFault ExceptionType = "device_fault"
+	ExcepLost             ExceptionType = "lost"
+	ExcepDamage           ExceptionType = "damage"
+	ExcepOverdue          ExceptionType = "overdue"
+	ExcepCrossReturn      ExceptionType = "cross_return"
+	ExcepManual           ExceptionType = "manual"
+	ExcepDeviceFault      ExceptionType = "device_fault"
+	ExcepUnlockFailed     ExceptionType = "unlock_failed"
+	ExcepCabinetOffline   ExceptionType = "cabinet_offline"
+	ExcepBatteryMissing   ExceptionType = "battery_missing"
+	ExcepLockStuck        ExceptionType = "lock_stuck"
+	ExcepCrossSuspicion   ExceptionType = "cross_suspicion"
+	ExcepUnclaimedBattery ExceptionType = "unclaimed_battery"
+	ExcepRepairInbound    ExceptionType = "repair_inbound"
 )
 
 type ExceptionRecord struct {

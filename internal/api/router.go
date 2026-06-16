@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -60,6 +61,7 @@ func (r *Router) RegisterRoutes(e *gin.Engine) {
 		user.GET("/orders/:id", r.GetOrderDetail)
 		user.POST("/dispute", r.CreateDispute)
 		user.GET("/disputes", r.ListDisputes)
+		user.POST("/report-unlock-failure", middleware.Idempotent(3600), r.ReportUnlockFailure)
 	}
 
 	pay := api.Group("/pay")
@@ -107,6 +109,11 @@ func (r *Router) RegisterRoutes(e *gin.Engine) {
 		admin.GET("/exceptions", r.ListExceptions)
 		admin.GET("/reports", r.ListReports)
 		admin.POST("/slots/batch-create", r.BatchCreateSlots)
+		admin.GET("/return-records", r.ListReturnRecords)
+		admin.GET("/return-records/:id", r.GetReturnRecordDetail)
+		admin.POST("/orders/handle-compensation", r.HandleAbnormalCompensation)
+		admin.GET("/abnormal-orders", r.ListAbnormalOrders)
+		admin.GET("/abnormal-orders/:id", r.GetAbnormalOrderDetail)
 	}
 }
 
@@ -863,4 +870,267 @@ func (r *Router) BatchCreateSlots(c *gin.Context) {
 		return
 	}
 	utils.OK(c, slots)
+}
+
+func (r *Router) ReportUnlockFailure(c *gin.Context) {
+	var req handlers.ReportUnlockFailureReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Fail(c, 400, "参数错误："+err.Error())
+		return
+	}
+	uid := middleware.GetUserID(c)
+	resp, err := r.rental.ReportUnlockFailure(c.Request.Context(), uid, &req)
+	if err != nil {
+		utils.Fail(c, 400, err.Error())
+		return
+	}
+	utils.OK(c, resp)
+}
+
+func (r *Router) ListReturnRecords(c *gin.Context) {
+	var list []models.ReturnRecord
+	var total int64
+	q := database.DB.Model(&models.ReturnRecord{})
+	if cc := c.Query("cross_category"); cc != "" {
+		q = q.Where("cross_category = ?", cc)
+	}
+	if cn := c.Query("cabinet_no"); cn != "" {
+		var cab models.Cabinet
+		if err := database.DB.Where("cabinet_no = ?", cn).First(&cab).Error; err == nil {
+			q = q.Where("cabinet_id = ?", cab.ID)
+		}
+	}
+	q.Count(&total)
+	page := utils.ParseInt(c.DefaultQuery("page", "1"))
+	size := utils.ParseInt(c.DefaultQuery("size", "20"))
+	if page < 1 {
+		page = 1
+	}
+	if size < 1 || size > 200 {
+		size = 20
+	}
+	err := q.Preload("Order").Preload("Order.Battery").
+		Order("id DESC").Offset((page - 1) * size).Limit(size).Find(&list).Error
+	if err != nil {
+		utils.Fail(c, 500, "查询失败")
+		return
+	}
+	utils.OK(c, gin.H{"list": list, "total": total, "page": page, "size": size})
+}
+
+func (r *Router) GetReturnRecordDetail(c *gin.Context) {
+	id := utils.ParseUint(c.Param("id"))
+	var rec models.ReturnRecord
+	if err := database.DB.Preload("Order").Preload("Order.Battery").Preload("Order.Rule").
+		First(&rec, id).Error; err != nil {
+		utils.Fail(c, 404, "记录不存在")
+		return
+	}
+	var cab models.Cabinet
+	var slot models.Slot
+	var battery models.Battery
+	database.DB.First(&cab, rec.CabinetID)
+	database.DB.First(&slot, rec.SlotID)
+	database.DB.First(&battery, rec.BatteryID)
+	utils.OK(c, gin.H{
+		"record":   rec,
+		"cabinet":  cab,
+		"slot":     slot,
+		"battery":  battery,
+	})
+}
+
+type HandleCompensationReq struct {
+	OrderNo  string `json:"order_no" binding:"required"`
+	Action   string `json:"action" binding:"required"`
+	Operator uint64 `json:"-"`
+	Remarks  string `json:"remarks"`
+}
+
+func (r *Router) HandleAbnormalCompensation(c *gin.Context) {
+	var req HandleCompensationReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Fail(c, 400, "参数错误")
+		return
+	}
+	req.Operator = middleware.GetUserID(c)
+
+	var order models.RentalOrder
+	if err := database.DB.Where("order_no = ?", req.OrderNo).First(&order).Error; err != nil {
+		utils.Fail(c, 404, "订单不存在")
+		return
+	}
+	if order.Status != models.OrderAbnormal {
+		utils.Fail(c, 400, "订单状态不是异常单，无需补偿")
+		return
+	}
+	if order.CompensationStatus != 0 && order.CompensationStatus != 2 {
+		utils.Fail(c, 400, "该订单已处理过补偿")
+		return
+	}
+
+	tx := database.DB.Begin()
+	now := time.Now()
+	action := models.CompensationAction(req.Action)
+
+	switch action {
+	case models.CompensationRefundDeposit:
+		if order.DepositStatus == 1 && order.DepositAmt > 0 {
+			var user models.User
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&user, order.UserID).Error; err != nil {
+				tx.Rollback()
+				utils.Fail(c, 500, "查询用户失败")
+				return
+			}
+			refundAmt := order.DepositAmt
+			user.Balance += refundAmt
+			if err := tx.Save(&user).Error; err != nil {
+				tx.Rollback()
+				utils.Fail(c, 500, "更新用户余额失败")
+				return
+			}
+			tx.Create(&models.DepositRecord{
+				OrderID:     order.ID,
+				UserID:      order.UserID,
+				Action:      models.DepositRelease,
+				Amount:      refundAmt,
+				BeforeBal:   user.Balance - refundAmt,
+				AfterBal:    user.Balance,
+				TxnID:       utils.GenTxnID(),
+				Status:      1,
+				Reason:      fmt.Sprintf("运营开柜失败补偿押金退还：订单%s，备注：%s", order.OrderNo, req.Remarks),
+				ProcessedAt: &now,
+			})
+			order.DepositStatus = 2
+			order.RefundAmt = refundAmt
+		}
+		order.Status = models.OrderAbnormalCompensated
+		order.CompensationStatus = 1
+	case models.CompensationRecreateOrder:
+		if order.BatteryID == 0 {
+			tx.Rollback()
+			utils.Fail(c, 400, "订单无电池信息，无法补开")
+			return
+		}
+		order.Status = models.OrderRenting
+		order.BillingEnabled = true
+		order.StartTime = &now
+		order.CompensationStatus = 1
+	case models.CompensationManualReview:
+		order.CompensationStatus = 2
+	default:
+		tx.Rollback()
+		utils.Fail(c, 400, "不支持的补偿动作："+req.Action)
+		return
+	}
+
+	updates := map[string]interface{}{
+		"status":              order.Status,
+		"billing_enabled":     order.BillingEnabled,
+		"compensation_action": action,
+		"compensation_status": order.CompensationStatus,
+		"deposit_status":      order.DepositStatus,
+		"refund_amt":          order.RefundAmt,
+		"compensation_remark": fmt.Sprintf("[运营处理]%s | 原备注：%s", req.Remarks, order.CompensationRemark),
+		"compensated_by":      &req.Operator,
+		"compensated_at":      &now,
+	}
+	if order.StartTime != nil && action == models.CompensationRecreateOrder {
+		updates["start_time"] = order.StartTime
+	}
+
+	if err := tx.Model(&order).Updates(updates).Error; err != nil {
+		tx.Rollback()
+		utils.Fail(c, 500, "更新订单失败")
+		return
+	}
+
+	tx.Model(&models.ExceptionRecord{}).Where("order_id = ?", order.ID).
+		Updates(map[string]interface{}{
+			"status":     1,
+			"handled_by": &req.Operator,
+			"handled_at": &now,
+		})
+
+	if err := tx.Commit().Error; err != nil {
+		utils.Fail(c, 500, "提交事务失败")
+		return
+	}
+	utils.OK(c, gin.H{
+		"order_no":           order.OrderNo,
+		"action":             action,
+		"compensation_status": order.CompensationStatus,
+	})
+}
+
+func (r *Router) ListAbnormalOrders(c *gin.Context) {
+	var list []models.RentalOrder
+	var total int64
+	q := database.DB.Model(&models.RentalOrder{}).Where("status IN ?", []models.OrderStatus{
+		models.OrderAbnormal, models.OrderAbnormalCompensated,
+	})
+	if ar := c.Query("abnormal_reason"); ar != "" {
+		q = q.Where("abnormal_reason = ?", ar)
+	}
+	if cs := c.Query("compensation_status"); cs != "" {
+		q = q.Where("compensation_status = ?", utils.ParseInt(cs))
+	}
+	q.Count(&total)
+	page := utils.ParseInt(c.DefaultQuery("page", "1"))
+	size := utils.ParseInt(c.DefaultQuery("size", "20"))
+	if page < 1 {
+		page = 1
+	}
+	if size < 1 || size > 100 {
+		size = 20
+	}
+	q.Preload("Battery").Order("id DESC").Offset((page - 1) * size).Limit(size).Find(&list)
+	utils.OK(c, gin.H{"list": list, "total": total, "page": page, "size": size})
+}
+
+func (r *Router) GetAbnormalOrderDetail(c *gin.Context) {
+	id := utils.ParseUint(c.Param("id"))
+	var order models.RentalOrder
+	if err := database.DB.Preload("Battery").Preload("Rule").
+		Where("id = ? AND status IN ?", id, []models.OrderStatus{
+			models.OrderAbnormal, models.OrderAbnormalCompensated,
+		}).First(&order).Error; err != nil {
+		utils.Fail(c, 404, "异常订单不存在")
+		return
+	}
+	var exceptions []models.ExceptionRecord
+	database.DB.Where("order_id = ?", id).Find(&exceptions)
+	var depos []models.DepositRecord
+	database.DB.Where("order_id = ?", id).Find(&depos)
+	var fromCabinet models.Cabinet
+	database.DB.First(&fromCabinet, order.FromCabinetID)
+	var fromSlot models.Slot
+	database.DB.First(&fromSlot, order.FromSlotID)
+	evidence := gin.H{
+		"abnormal_reason":      order.AbnormalReason,
+		"compensation_action":  order.CompensationAction,
+		"compensation_status":  order.CompensationStatus,
+		"compensation_remark":  order.CompensationRemark,
+		"billing_enabled":      order.BillingEnabled,
+		"deposit_amt":          order.DepositAmt,
+		"deposit_status":       order.DepositStatus,
+		"refund_amt":           order.RefundAmt,
+		"from_cabinet":         fromCabinet,
+		"from_slot":            fromSlot,
+	}
+	if order.CompensatedBy != nil {
+		var operator models.User
+		if database.DB.First(&operator, *order.CompensatedBy).Error == nil {
+			evidence["compensated_by"] = gin.H{"id": operator.ID, "phone": operator.Phone, "role": operator.Role}
+		}
+	}
+	if order.CompensatedAt != nil {
+		evidence["compensated_at"] = order.CompensatedAt
+	}
+	utils.OK(c, gin.H{
+		"order":      order,
+		"exceptions": exceptions,
+		"deposits":   depos,
+		"evidence":   evidence,
+	})
 }

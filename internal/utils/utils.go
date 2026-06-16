@@ -106,6 +106,20 @@ func ParseInt(s string) int {
 	return v
 }
 
+type DefaultTime time.Time
+
+func OrDefaultTime(t *time.Time, fallback string) DefaultTime {
+	if t != nil {
+		return DefaultTime(*t)
+	}
+	dt, _ := time.Parse("2006-01-02 15:04", fallback)
+	return DefaultTime(dt)
+}
+
+func (d DefaultTime) Format(layout string) string {
+	return time.Time(d).Format(layout)
+}
+
 func CalcFee(durationSec int64, freeMin, firstMin int, firstPrice int64, unitMin int, unitPrice int64, dailyCap int64, maxDays int, maxFee int64) (int64, bool, int) {
 	totalMin := int(math.Ceil(float64(durationSec) / 60.0))
 	if totalMin <= freeMin {
